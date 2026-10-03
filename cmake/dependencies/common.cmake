@@ -52,8 +52,19 @@ endif()
 
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
-file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
-file(WRITE "${STB_DIR}/stb_impl.c" "#define STB_IMAGE_IMPLEMENTATION\n#include \"stb_image.h\"")
+# Reuse the pinned header on reconfigure; a failed download must not silently
+# truncate an existing header and produce missing stb declarations at compile time.
+set(STB_IMAGE_SHA256 "c54b15a689e6a1f32c75e2ec23afa442e3e0e37e894b73c1974d08679b20dd5c")
+set(_stb_image_hash "")
+if(EXISTS "${STB_DIR}/stb_image.h")
+    file(SHA256 "${STB_DIR}/stb_image.h" _stb_image_hash)
+endif()
+if(NOT _stb_image_hash STREQUAL STB_IMAGE_SHA256)
+    file(DOWNLOAD "https://raw.githubusercontent.com/nothings/stb/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h"
+        "${STB_DIR}/stb_image.h"
+        EXPECTED_HASH "SHA256=${STB_IMAGE_SHA256}" TLS_VERIFY ON)
+endif()
+configure_file("${CMAKE_CURRENT_LIST_DIR}/stb_impl.c.in" "${STB_DIR}/stb_impl.c" COPYONLY)
 
 add_library(stb STATIC)
 

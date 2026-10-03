@@ -8,6 +8,7 @@ union Gfx;
 #include "interpreter.h"
 
 namespace Fast {
+class Rt64Renderer;
 class Fast3dWindow : public Ship::Window {
   public:
     Fast3dWindow();
@@ -59,6 +60,9 @@ class Fast3dWindow : public Ship::Window {
     bool DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
 
     std::weak_ptr<Interpreter> GetInterpreterWeak() const;
+#ifdef SHIP_USE_RT64
+    Rt64Renderer* GetRt64Renderer() const { return mRt64.get(); }
+#endif
 
   protected:
     static bool KeyDown(int32_t scancode);
@@ -69,6 +73,9 @@ class Fast3dWindow : public Ship::Window {
     static void OnFullscreenChanged(bool isNowFullscreen);
 
   private:
+#ifdef SHIP_USE_RT64
+    std::unique_ptr<Rt64Renderer> mRt64;
+#endif
     GfxRenderingAPI* mRenderingApi;
     GfxWindowBackend* mWindowManagerApi;
     std::shared_ptr<Interpreter> mInterpreter = nullptr;

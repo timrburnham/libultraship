@@ -14,6 +14,10 @@
 #include "fast/backends/gfx_window_manager_api.h"
 
 #include <fstream>
+#ifdef SHIP_USE_RT64
+#include "fast/rt64/Renderer.h"
+#include "fast/rt64/SdlVulkanWindow.h"
+#endif
 
 namespace Fast {
 
@@ -26,6 +30,9 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
     mInterpreter = std::make_shared<Interpreter>();
     GfxSetInstance(mInterpreter);
 
+#ifdef SHIP_USE_RT64
+    AddAvailableWindowBackend(Ship::WindowBackend::RT64_SDL_VULKAN);
+#else
 #ifdef _WIN32
     AddAvailableWindowBackend(Ship::WindowBackend::FAST3D_DXGI_DX11);
 #endif
@@ -35,6 +42,7 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
     }
 #endif
     AddAvailableWindowBackend(Ship::WindowBackend::FAST3D_SDL_OPENGL);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -50,8 +58,15 @@ Fast3dWindow::Fast3dWindow() : Fast3dWindow(std::vector<std::shared_ptr<Ship::Gu
 
 Fast3dWindow::~Fast3dWindow() {
     SPDLOG_DEBUG("destruct fast3dwindow");
+#ifdef SHIP_USE_RT64
+    mInterpreter->TextureCacheClear();
+    mRt64.reset();
+    mInterpreter->mRapi = nullptr;
+    if (mWindowManagerApi) mWindowManagerApi->Destroy();
+#else
     mInterpreter->Destroy();
     delete mRenderingApi;
+#endif
     delete mWindowManagerApi;
 }
 
@@ -97,8 +112,25 @@ void Fast3dWindow::Init() {
         Ship::Context::GetInstance()->GetConfig()->GetInt("Shortcuts.MouseCapture", Ship::KbScancode::LUS_KB_F2));
 
     InitWindowManager();
+#ifdef SHIP_USE_RT64
+    mWindowManagerApi->Init(Ship::Context::GetInstance()->GetName().c_str(), "RT64 Vulkan", isFullscreen, width, height, posX, posY);
+    mRt64 = std::make_unique<Rt64Renderer>(static_cast<SdlVulkanWindow*>(mWindowManagerApi)->GetWindow());
+    mRenderingApi = mRt64->GetGuiApi();
+    mInterpreter->mRapi = mRenderingApi;
+    mInterpreter->mWapi = mWindowManagerApi;
+    mInterpreter->mCurDimensions.width = 320;
+    mInterpreter->mCurDimensions.height = 240;
+    mInterpreter->mCurDimensions.internal_mul = 1.0f;
+    mInterpreter->mNativeDimensions.width = 320;
+    mInterpreter->mNativeDimensions.height = 240;
+    mInterpreter->mCurDimensions.aspect_ratio = 4.0f / 3.0f;
+    Ship::GuiWindowInitData guiData{};
+    guiData.Opengl.Window = static_cast<SdlVulkanWindow*>(mWindowManagerApi)->GetWindow();
+    GetGui()->Init(guiData);
+#else
     mInterpreter->Init(mWindowManagerApi, mRenderingApi, Ship::Context::GetInstance()->GetName().c_str(), isFullscreen,
                        width, height, posX, posY);
+#endif
     mWindowManagerApi->SetFullscreenChangedCallback(OnFullscreenChanged);
     mWindowManagerApi->SetKeyboardCallbacks(KeyDown, KeyUp, AllKeysUp);
     mWindowManagerApi->SetMouseCallbacks(MouseButtonDown, MouseButtonUp);
@@ -108,26 +140,50 @@ void Fast3dWindow::Init() {
 }
 
 int32_t Fast3dWindow::GetTargetFps() {
+#ifdef SHIP_USE_RT64
+    return mWindowManagerApi->GetTargetFps();
+#else
     return mInterpreter->GetTargetFps();
+#endif
 }
 
 void Fast3dWindow::SetTargetFps(int32_t fps) {
+#ifdef SHIP_USE_RT64
+    mWindowManagerApi->SetTargetFps(fps);
+#else
     mInterpreter->SetTargetFps(fps);
+#endif
 }
 
 void Fast3dWindow::SetMaximumFrameLatency(int32_t latency) {
+#ifdef SHIP_USE_RT64
+    mWindowManagerApi->SetMaxFrameLatency(latency);
+#else
     mInterpreter->SetMaxFrameLatency(latency);
+#endif
 }
 
 void Fast3dWindow::GetPixelDepthPrepare(float x, float y) {
+#ifdef SHIP_USE_RT64
+    // RT64 fullSync synchronizes the native depth buffer before returning.
+#else
     mInterpreter->GetPixelDepthPrepare(x, y);
+#endif
 }
 
 uint16_t Fast3dWindow::GetPixelDepth(float x, float y) {
+#ifdef SHIP_USE_RT64
+    return mRt64->GetDepth(x,y);
+#else
     return mInterpreter->GetPixelDepth(x, y);
+#endif
 }
 
 void Fast3dWindow::InitWindowManager() {
+#ifdef SHIP_USE_RT64
+    SetWindowBackend(Ship::WindowBackend::RT64_SDL_VULKAN);
+    mWindowManagerApi = new SdlVulkanWindow();
+#else
     SetWindowBackend(Ship::Context::GetInstance()->GetConfig()->GetWindowBackend());
 
     switch (GetWindowBackend()) {
@@ -153,18 +209,31 @@ void Fast3dWindow::InitWindowManager() {
             SPDLOG_ERROR("Could not load the correct rendering backend");
             break;
     }
+#endif
 }
 
 void Fast3dWindow::SetTextureFilter(FilteringMode filteringMode) {
+#ifdef SHIP_USE_RT64
+    mRt64->SetTextureFilter(filteringMode);
+#else
     mInterpreter->GetCurrentRenderingAPI()->SetTextureFilter(filteringMode);
+#endif
 }
 
 void Fast3dWindow::EnableSRGBMode() {
+#ifdef SHIP_USE_RT64
+    // RT64 handles the swapchain color format.
+#else
     mInterpreter->mRapi->SetSrgbMode();
+#endif
 }
 
 void Fast3dWindow::SetRendererUCode(UcodeHandlers ucode) {
+#ifdef SHIP_USE_RT64
+    if (ucode != UcodeHandlers::ucode_f3dex2) throw std::runtime_error("RT64 requires F3DEX2 display lists");
+#else
     gfx_set_target_ucode(ucode);
+#endif
 }
 
 void Fast3dWindow::Close() {
@@ -172,15 +241,29 @@ void Fast3dWindow::Close() {
 }
 
 void Fast3dWindow::RunGuiOnly() {
+#ifdef SHIP_USE_RT64
+    // The caller owns StartDraw/EndDraw; RT64 presents in EndFrame.
+#else
     mInterpreter->RunGuiOnly();
+#endif
 }
 
 void Fast3dWindow::StartFrame() {
+#ifdef SHIP_USE_RT64
+    mWindowManagerApi->HandleEvents();
+#else
     mInterpreter->StartFrame();
+#endif
 }
 
 void Fast3dWindow::EndFrame() {
+#ifdef SHIP_USE_RT64
+    mWindowManagerApi->SwapBuffersBegin();
+    mRt64->Present();
+    mWindowManagerApi->SwapBuffersEnd();
+#else
     mInterpreter->EndFrame();
+#endif
 }
 
 bool Fast3dWindow::IsFrameReady() {
@@ -198,17 +281,25 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     auto gui = wnd->GetGui();
     // Setup mouse state manager
     wnd->GetMouseStateManager()->StartFrame();
-    // Setup of the backend frames and draw initial Window and GUI menus
+    // Submit game work before locking GUI data consumed by RT64's presentation thread.
+#ifdef SHIP_USE_RT64
+    mRt64->Run(commands, mtxReplacements, mInterpreter->mInterpolationIndex);
     gui->StartDraw();
-    // Setup game framebuffers to match available window space
+#else
+    gui->StartDraw();
     mInterpreter->StartFrame();
-    // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
+#endif
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
     // Finalize swap buffers
+#ifdef SHIP_USE_RT64
+    mWindowManagerApi->SwapBuffersBegin();
+    mRt64->Present();
+    mWindowManagerApi->SwapBuffersEnd();
+#else
     mInterpreter->EndFrame();
-
+#endif
     return true;
 }
 
@@ -309,11 +400,19 @@ bool Fast3dWindow::CanDisableVerticalSync() {
 }
 
 void Fast3dWindow::SetResolutionMultiplier(float multiplier) {
+#ifdef SHIP_USE_RT64
+    mRt64->SetResolution(multiplier); mInterpreter->mCurDimensions.internal_mul = multiplier;
+#else
     mInterpreter->SetResolutionMultiplier(multiplier);
+#endif
 }
 
 void Fast3dWindow::SetMsaaLevel(uint32_t value) {
+#ifdef SHIP_USE_RT64
+    mRt64->SetMsaa(value);
+#else
     mInterpreter->SetMsaaLevel(value);
+#endif
 }
 
 void Fast3dWindow::SetFullscreen(bool isFullscreen) {
@@ -331,7 +430,11 @@ bool Fast3dWindow::IsRunning() {
 }
 
 uintptr_t Fast3dWindow::GetGfxFrameBuffer() {
+#ifdef SHIP_USE_RT64
+    return 0; // RT64 presents the game directly before the GUI overlay.
+#else
     return mInterpreter->mGfxFrameBuffer;
+#endif
 }
 
 const char* Fast3dWindow::GetKeyName(int32_t scancode) {

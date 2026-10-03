@@ -1,3 +1,7 @@
+#ifdef SHIP_USE_RT64
+#include "fast/rt64/Renderer.h"
+#include "imgui_impl_sdl2.h"
+#endif
 #define NOMINMAX
 
 #include "ship/window/gui/Gui.h"
@@ -94,7 +98,8 @@ Gui::~Gui() {
 
 void Gui::Init(GuiWindowInitData windowImpl) {
     mImpl = windowImpl;
-    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (!ctx) ctx = ImGui::CreateContext();
     ImGui::SetCurrentContext(ctx);
     mImGuiIo = &ImGui::GetIO();
     mImGuiIo->ConfigFlags |= ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_NoMouseCursorChange;
@@ -182,6 +187,9 @@ void Gui::ImGuiWMInit() {
 }
 
 void Gui::ShutDownImGui(Ship::Window* window) {
+#ifdef SHIP_USE_RT64
+    if (window->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) return; // RT64 owns the GUI context and device.
+#endif
     switch (window->GetWindowBackend()) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -265,6 +273,9 @@ void Gui::LoadTextureFromResource(const std::string& name, std::shared_ptr<GuiTe
 }
 
 bool Gui::SupportsViewports() {
+#ifdef SHIP_USE_RT64
+    if (Context::GetInstance()->GetWindow()->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) return false;
+#endif
 #ifdef __linux__
     const char* currentDesktop = std::getenv("XDG_CURRENT_DESKTOP");
     if (currentDesktop && std::string(currentDesktop) == "gamescope") {
@@ -291,6 +302,7 @@ void Gui::HandleWindowEvents(WindowEvent event) {
     switch (Context::GetInstance()->GetWindow()->GetWindowBackend()) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
+        case WindowBackend::RT64_SDL_VULKAN:
             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
 #if defined(__ANDROID__) || defined(__IOS__)
             Mobile::ImGuiProcessEvent(mImGuiIo->WantTextInput);
@@ -593,6 +605,13 @@ void Gui::HandleMouseCapture() {
 }
 
 void Gui::StartFrame() {
+#ifdef SHIP_USE_RT64
+    if (Context::GetInstance()->GetWindow()->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) {
+        HandleMouseCapture();
+        std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow())->GetRt64Renderer()->BeginGuiFrame();
+        return;
+    }
+#endif
     HandleMouseCapture();
     ImGuiBackendNewFrame();
     ImGuiWMNewFrame();
@@ -600,6 +619,12 @@ void Gui::StartFrame() {
 }
 
 void Gui::EndFrame() {
+#ifdef SHIP_USE_RT64
+    if (Context::GetInstance()->GetWindow()->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) {
+        std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow())->GetRt64Renderer()->EndGuiFrame();
+        return;
+    }
+#endif
     // Draw the ImGui "viewports" which are the floating windows.
     ImGui::Render();
     ImGuiRenderDrawData(ImGui::GetDrawData());
@@ -658,6 +683,16 @@ void Gui::CalculateGameViewport() {
         }
     }
 
+#ifdef SHIP_USE_RT64
+    if (Context::GetInstance()->GetWindow()->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) {
+        // Game framebuffer commands address native RDRAM. RT64 controls the
+        // GPU resolution separately, so window pixels must not change this ABI.
+        auto interpreter = mInterpreter.lock();
+        interpreter->mCurDimensions.width = 320;
+        interpreter->mCurDimensions.height = 240;
+        interpreter->mCurDimensions.aspect_ratio = 4.0f / 3.0f;
+    }
+#endif
     ImGui::End();
 }
 

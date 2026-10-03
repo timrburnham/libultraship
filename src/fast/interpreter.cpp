@@ -26,6 +26,9 @@
 
 #include "fast/interpreter.h"
 #include "fast/lus_gbi.h"
+#ifdef SHIP_USE_RT64
+#include "fast/rt64/TexturePatches.h"
+#endif
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
@@ -4501,9 +4504,11 @@ void Interpreter::SetMaxFrameLatency(int latency) {
 int Interpreter::CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                    uint8_t resize) {
     uint32_t orig_width = width, orig_height = height;
+#ifndef SHIP_USE_RT64
     if (resize) {
         AdjustWidthHeightForScale(width, height, native_width, native_height);
     }
+#endif
 
     int fb = mRapi->CreateFramebuffer();
     mRapi->UpdateFramebufferParameters(fb, width, height, 1, true, true, true, true);
@@ -4634,6 +4639,9 @@ void Interpreter::RegisterBlendedTexture(const char* name, uint8_t* mask, uint8_
     }
 
     mMaskedTextures[name] = MaskedTextureEntry{ mask, replacement };
+#ifdef SHIP_USE_RT64
+    Rt64TexturePatches::Register(name, mask, replacement);
+#endif
 }
 
 void Interpreter::UnregisterBlendedTexture(const char* name) {
@@ -4642,6 +4650,9 @@ void Interpreter::UnregisterBlendedTexture(const char* name) {
     }
 
     mMaskedTextures.erase(name);
+#ifdef SHIP_USE_RT64
+    Rt64TexturePatches::Unregister(name);
+#endif
 }
 
 // New getters and setters
