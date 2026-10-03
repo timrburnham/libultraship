@@ -120,7 +120,8 @@ void Fast3dWindow::Init() {
     mInterpreter->mWapi = mWindowManagerApi;
     mInterpreter->mCurDimensions.width = 320;
     mInterpreter->mCurDimensions.height = 240;
-    mInterpreter->mCurDimensions.internal_mul = 1.0f;
+    mInterpreter->mCurDimensions.internal_mul =
+        Ship::Context::GetInstance()->GetConsoleVariables()->GetFloat(CVAR_INTERNAL_RESOLUTION, 1);
     mInterpreter->mNativeDimensions.width = 320;
     mInterpreter->mNativeDimensions.height = 240;
     mInterpreter->mCurDimensions.aspect_ratio = 4.0f / 3.0f;
@@ -326,6 +327,9 @@ uint32_t Fast3dWindow::GetHeight() {
 }
 
 float Fast3dWindow::GetAspectRatio() {
+#ifdef SHIP_USE_RT64
+    if (mPrerenderedRoom) return 4.0f / 3.0f;
+#endif
     return mInterpreter->mCurDimensions.aspect_ratio;
 }
 
@@ -401,7 +405,7 @@ bool Fast3dWindow::CanDisableVerticalSync() {
 
 void Fast3dWindow::SetResolutionMultiplier(float multiplier) {
 #ifdef SHIP_USE_RT64
-    mRt64->SetResolution(multiplier); mInterpreter->mCurDimensions.internal_mul = multiplier;
+    mInterpreter->mCurDimensions.internal_mul = multiplier;
 #else
     mInterpreter->SetResolutionMultiplier(multiplier);
 #endif

@@ -18,6 +18,8 @@ class Rt64Renderer {
     void EndGuiFrame();
     void Present();
     void SetResolution(float multiplier);
+    void SetRenderSize(uint32_t width, uint32_t height);
+    void SetPresentationRect(float x, float y, float width, float height);
     void SetMsaa(uint32_t samples);
     void SetTextureFilter(FilteringMode mode);
     uint16_t GetDepth(float x, float y);

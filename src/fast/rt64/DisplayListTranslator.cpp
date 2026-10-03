@@ -180,7 +180,8 @@ MtxS ToFixedMatrix(const MtxF& matrix) {
     for (size_t row = 0; row < 4; ++row) {
         for (size_t column = 0; column < 4; ++column) {
             const double scaled = static_cast<double>(matrix.mf[row][column]) * 65536.0;
-            const int64_t fixed = static_cast<int64_t>(std::llround(scaled));
+            // Match guMtxF2L: native and interpolated draws must quantize identically.
+            const int64_t fixed = static_cast<int64_t>(scaled);
             result.intPart[row][column ^ 1] = static_cast<uint16_t>(static_cast<int16_t>(fixed >> 16));
             result.fracPart[row][column ^ 1] = static_cast<uint16_t>(fixed & 0xffff);
         }
@@ -243,6 +244,7 @@ void DisplayListTranslator::Reset() {
     mInterpolationIndex = 0;
     mInterpolationIndexTarget = 0;
     mFramebufferOperations.clear();
+    mNativeWideRectangles.clear();
     mNativeTextures.clear();
 }
 
@@ -1065,17 +1067,23 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
             }
             const Gfx& endpoints = commands[++commandIndex];
             const Gfx& textureStep = commands[++commandIndex];
-            const uint32_t lrx = static_cast<uint32_t>(SignExtend24(w0)) & 0xfff;
-            const uint32_t lry = static_cast<uint32_t>(SignExtend24(w1)) & 0xfff;
-            const uint32_t tile = Field(static_cast<uint32_t>(endpoints.words.w0), 24, 3);
-            const uint32_t ulx = static_cast<uint32_t>(SignExtend24(static_cast<uint32_t>(endpoints.words.w0))) & 0xfff;
-            const uint32_t uly = static_cast<uint32_t>(SignExtend24(static_cast<uint32_t>(endpoints.words.w1))) & 0xfff;
-            emit((static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_TEXRECT)) << 24) | (lrx << 12) | lry,
-                 (tile << 24) | (ulx << 12) | uly);
-            emit(static_cast<uint32_t>(F3DEX2_G_RDPHALF_1) << 24,
-                 static_cast<uint32_t>(textureStep.words.w0));
-            emit(static_cast<uint32_t>(F3DEX2_G_RDPHALF_2) << 24,
-                 static_cast<uint32_t>(textureStep.words.w1));
+            const uint32_t endpointW0 = static_cast<uint32_t>(endpoints.words.w0);
+            const uint32_t endpointW1 = static_cast<uint32_t>(endpoints.words.w1);
+            const uint32_t stepW0 = static_cast<uint32_t>(textureStep.words.w0);
+            const uint32_t stepW1 = static_cast<uint32_t>(textureStep.words.w1);
+            NativeWideRectangle rectangle{};
+            rectangle.ulx = SignExtend24(endpointW0);
+            rectangle.uly = SignExtend24(endpointW1);
+            rectangle.lrx = SignExtend24(w0);
+            rectangle.lry = SignExtend24(w1);
+            rectangle.uls = static_cast<int16_t>(stepW0 >> 16);
+            rectangle.ult = static_cast<int16_t>(stepW0);
+            rectangle.dsdx = static_cast<int16_t>(stepW1 >> 16);
+            rectangle.dtdy = static_cast<int16_t>(stepW1);
+            rectangle.tile = static_cast<uint8_t>(Field(endpointW0, 24, 3));
+            const uint32_t rectangleIndex = static_cast<uint32_t>(mNativeWideRectangles.size());
+            mNativeWideRectangles.emplace_back(rectangle);
+            emit(static_cast<uint32_t>(NativeWideRectangleOpcode) << 24, rectangleIndex);
             continue;
         }
         if (opcode == OTR_G_FILLWIDERECT) {
@@ -1083,12 +1091,15 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
                 throw std::runtime_error("Truncated wide fill-rectangle command");
             }
             const Gfx& upperLeft = commands[++commandIndex];
-            const uint32_t lrx = static_cast<uint32_t>(SignExtend24(w0)) & 0xfff;
-            const uint32_t lry = static_cast<uint32_t>(SignExtend24(w1)) & 0xfff;
-            const uint32_t ulx = static_cast<uint32_t>(SignExtend24(static_cast<uint32_t>(upperLeft.words.w0))) & 0xfff;
-            const uint32_t uly = static_cast<uint32_t>(SignExtend24(static_cast<uint32_t>(upperLeft.words.w1))) & 0xfff;
-            emit((static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_FILLRECT)) << 24) | (lrx << 12) | lry,
-                 (ulx << 12) | uly);
+            NativeWideRectangle rectangle{};
+            rectangle.ulx = SignExtend24(static_cast<uint32_t>(upperLeft.words.w0));
+            rectangle.uly = SignExtend24(static_cast<uint32_t>(upperLeft.words.w1));
+            rectangle.lrx = SignExtend24(w0);
+            rectangle.lry = SignExtend24(w1);
+            rectangle.fill = true;
+            const uint32_t rectangleIndex = static_cast<uint32_t>(mNativeWideRectangles.size());
+            mNativeWideRectangles.emplace_back(rectangle);
+            emit(static_cast<uint32_t>(NativeWideRectangleOpcode) << 24, rectangleIndex);
             continue;
         }
         if (opcode == OTR_G_SETTIMG_FB) {
@@ -1197,16 +1208,16 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
             const uint32_t tile = w0 & 7u;
             const uint32_t width = static_cast<uint16_t>(static_cast<uint32_t>(source.words.w1) >> 16);
             const uint32_t height = static_cast<uint16_t>(source.words.w1);
-            const uint32_t ulx = static_cast<uint16_t>(static_cast<uint32_t>(first.words.w0) >> 16) & 0xfffu;
-            const uint32_t uly = static_cast<uint16_t>(first.words.w0) & 0xfffu;
-            const uint32_t lrx = static_cast<uint16_t>(static_cast<uint32_t>(second.words.w0) >> 16) & 0xfffu;
-            const uint32_t lry = static_cast<uint16_t>(second.words.w0) & 0xfffu;
+            const int32_t ulx = static_cast<int16_t>(static_cast<uint32_t>(first.words.w0) >> 16);
+            const int32_t uly = static_cast<int16_t>(first.words.w0);
+            const int32_t lrx = static_cast<int16_t>(static_cast<uint32_t>(second.words.w0) >> 16);
+            const int32_t lry = static_cast<int16_t>(second.words.w0);
             const int32_t s0 = static_cast<int16_t>(static_cast<uint32_t>(first.words.w1) >> 16);
             const int32_t t0 = static_cast<int16_t>(first.words.w1);
             const int32_t s1 = static_cast<int16_t>(static_cast<uint32_t>(second.words.w1) >> 16);
             const int32_t t1 = static_cast<int16_t>(second.words.w1);
-            const int32_t dx = static_cast<int32_t>(lrx) - static_cast<int32_t>(ulx);
-            const int32_t dy = static_cast<int32_t>(lry) - static_cast<int32_t>(uly);
+            const int32_t dx = lrx - ulx;
+            const int32_t dy = lry - uly;
             if (width == 0 || height == 0 || dx <= 0 || dy <= 0) {
                 throw std::runtime_error("G_IMAGERECT has empty image or rectangle dimensions");
             }
@@ -1231,6 +1242,38 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
             }
             const int32_t dsdx = static_cast<int32_t>((static_cast<int64_t>(s1 - s0) * 4096) / dx);
             const int32_t dtdy = static_cast<int32_t>((static_cast<int64_t>(deltaT) * 4096) / dy);
+            // Native framebuffer images are not limited by TMEM. One image
+            // preserves the full-resolution copy and avoids seams between strips.
+            if (sourceWidth <= 1024 && sourceHeight <= 1024) {
+                const uint32_t tileW0 = (static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_SETTILE)) << 24) |
+                                       (G_IM_SIZ_16b << 19) | (((sourceWidth * 2 + 7) / 8) << 9);
+                emit(tileW0, (tile << 24) | (G_TX_CLAMP << 18) | (G_TX_CLAMP << 8));
+                emit(static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_SETTILESIZE)) << 24,
+                     (tile << 24) | ((sourceWidth - 1) * 4 << 12) | ((sourceHeight - 1) * 4));
+                FramebufferOperation operation{};
+                operation.type = FramebufferOperation::Type::BindTexture;
+                operation.sourceId = mCurrentTextureFramebufferId;
+                operation.width = sourceWidth;
+                operation.height = sourceHeight;
+                operation.format = G_IM_FMT_RGBA;
+                operation.sizeCode = G_IM_SIZ_16b;
+                operation.tile = tile;
+                mFramebufferOperations.emplace_back(operation);
+                emit(static_cast<uint32_t>(NativeFramebufferOperationOpcode) << 24,
+                     static_cast<uint32_t>(mFramebufferOperations.size() - 1));
+                NativeWideRectangle rectangle{};
+                rectangle.ulx = ulx; rectangle.uly = uly;
+                rectangle.lrx = lrx; rectangle.lry = lry;
+                rectangle.uls = static_cast<int16_t>(s0 * 32);
+                rectangle.ult = static_cast<int16_t>(t0 * 32);
+                rectangle.dsdx = static_cast<int16_t>(dsdx);
+                rectangle.dtdy = static_cast<int16_t>(dtdy);
+                rectangle.tile = tile;
+                mNativeWideRectangles.emplace_back(rectangle);
+                emit(static_cast<uint32_t>(NativeWideRectangleOpcode) << 24,
+                     static_cast<uint32_t>(mNativeWideRectangles.size() - 1));
+                continue;
+            }
             const uint32_t imageW0 = (static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_SETTIMG)) << 24) |
                                      (2u << 19) | ((sourceWidth - 1) & 0xfffu);
             for (uint32_t row = 0; row < sourceHeight; row += rowsPerLoad) {
@@ -1240,10 +1283,10 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
                 if (firstT >= lastT) {
                     continue;
                 }
-                const uint32_t y0 = std::clamp<uint32_t>(
-                    uly + static_cast<uint32_t>((static_cast<int64_t>(firstT - t0) * dy) / deltaT), uly, lry);
-                const uint32_t y1 = std::clamp<uint32_t>(
-                    uly + static_cast<uint32_t>((static_cast<int64_t>(lastT - t0) * dy) / deltaT), uly, lry);
+                const int32_t y0 = std::clamp<int32_t>(
+                    uly + static_cast<int32_t>((static_cast<int64_t>(firstT - t0) * dy) / deltaT), uly, lry);
+                const int32_t y1 = std::clamp<int32_t>(
+                    uly + static_cast<int32_t>((static_cast<int64_t>(lastT - t0) * dy) / deltaT), uly, lry);
                 if (y0 >= y1) {
                     continue;
                 }
@@ -1254,10 +1297,10 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
                     if (firstS >= lastS) {
                         continue;
                     }
-                    const uint32_t x0 = std::clamp<uint32_t>(
-                        ulx + static_cast<uint32_t>((static_cast<int64_t>(firstS - s0) * dx) / deltaS), ulx, lrx);
-                    const uint32_t x1 = std::clamp<uint32_t>(
-                        ulx + static_cast<uint32_t>((static_cast<int64_t>(lastS - s0) * dx) / deltaS), ulx, lrx);
+                    const int32_t x0 = std::clamp<int32_t>(
+                        ulx + static_cast<int32_t>((static_cast<int64_t>(firstS - s0) * dx) / deltaS), ulx, lrx);
+                    const int32_t x1 = std::clamp<int32_t>(
+                        ulx + static_cast<int32_t>((static_cast<int64_t>(lastS - s0) * dx) / deltaS), ulx, lrx);
                     if (x0 >= x1) {
                         continue;
                     }
@@ -1275,13 +1318,32 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
                     emit(loadTileW0, tile << 24);
                     emit(static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_SETTILESIZE)) << 24,
                          (tile << 24) | tileExtentW | tileExtentH);
-                    emit((static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_TEXRECT)) << 24) | (x1 << 12) | y1,
-                         (tile << 24) | (x0 << 12) | y0);
-                    emit(static_cast<uint32_t>(static_cast<uint8_t>(F3DEX2_G_RDPHALF_1)) << 24,
-                         (static_cast<uint32_t>((firstS - static_cast<int32_t>(column)) << 5) << 16) |
-                             static_cast<uint16_t>((firstT - static_cast<int32_t>(row)) << 5));
-                    emit(static_cast<uint32_t>(static_cast<uint8_t>(F3DEX2_G_RDPHALF_2)) << 24,
-                         (static_cast<uint32_t>(dsdx) << 16) | static_cast<uint16_t>(dtdy));
+                    const int32_t uls = (firstS - static_cast<int32_t>(column)) << 5;
+                    const int32_t ult = (firstT - static_cast<int32_t>(row)) << 5;
+                    if (x0 < 0 || y0 < 0 || x1 > 0xfff || y1 > 0xfff) {
+                        NativeWideRectangle rectangle{};
+                        rectangle.ulx = x0;
+                        rectangle.uly = y0;
+                        rectangle.lrx = x1;
+                        rectangle.lry = y1;
+                        rectangle.uls = static_cast<int16_t>(uls);
+                        rectangle.ult = static_cast<int16_t>(ult);
+                        rectangle.dsdx = static_cast<int16_t>(dsdx);
+                        rectangle.dtdy = static_cast<int16_t>(dtdy);
+                        rectangle.tile = static_cast<uint8_t>(tile);
+                        const uint32_t rectangleIndex = static_cast<uint32_t>(mNativeWideRectangles.size());
+                        mNativeWideRectangles.emplace_back(rectangle);
+                        emit(static_cast<uint32_t>(NativeWideRectangleOpcode) << 24, rectangleIndex);
+                    } else {
+                        emit((static_cast<uint32_t>(static_cast<uint8_t>(RDP_G_TEXRECT)) << 24) |
+                                 (static_cast<uint32_t>(x1) << 12) | static_cast<uint32_t>(y1),
+                             (tile << 24) | (static_cast<uint32_t>(x0) << 12) |
+                                 static_cast<uint32_t>(y0));
+                        emit(static_cast<uint32_t>(static_cast<uint8_t>(F3DEX2_G_RDPHALF_1)) << 24,
+                             (static_cast<uint32_t>(uls) << 16) | static_cast<uint16_t>(ult));
+                        emit(static_cast<uint32_t>(static_cast<uint8_t>(F3DEX2_G_RDPHALF_2)) << 24,
+                             (static_cast<uint32_t>(dsdx) << 16) | static_cast<uint16_t>(dtdy));
+                    }
                 }
             }
             continue;
@@ -1450,6 +1512,70 @@ uint32_t DisplayListTranslator::LowerDisplayList(Gfx* commands, size_t depth) {
             mSegments[segment] = base;
             lowerW0 = static_cast<uint32_t>(F3DEX2_G_SPNOOP) << 24;
             lowerW1 = 0;
+        } else if (opcode == static_cast<uint8_t>(RDP_G_LOADBLOCK)) {
+            // CALC_DXT in the legacy macros floors width to 64-bit words.
+            // For widths such as 46 IA8 texels it produces a five-word DXT,
+            // while the render tile line is rounded up to six words. RT64
+            // uses DXT to advance/swap TMEM rows, so normalize only the
+            // recognizable DPLoadTextureBlock sequence where its render-tile
+            // line and size are available immediately afterward.
+            bool pipeSyncSeen = false;
+            for (size_t lookahead = commandIndex + 1;
+                 lookahead < std::min(commandIndex + 7, MaxCommands); ++lookahead) {
+                const uint32_t nextW0 = static_cast<uint32_t>(commands[lookahead].words.w0);
+                const uint32_t nextW1 = static_cast<uint32_t>(commands[lookahead].words.w1);
+                const uint32_t nextOpcode = Opcode(nextW0);
+                if (nextOpcode == static_cast<uint8_t>(F3DEX2_G_ENDDL) ||
+                    nextOpcode == static_cast<uint8_t>(F3DEX2_G_DL)) {
+                    break;
+                }
+                if (nextOpcode == static_cast<uint8_t>(RDP_G_RDPPIPESYNC)) {
+                    pipeSyncSeen = true;
+                    continue;
+                }
+                if (!pipeSyncSeen) {
+                    continue;
+                }
+                if (nextOpcode == static_cast<uint8_t>(RDP_G_SETTILE)) {
+                    const uint32_t renderTile = Field(nextW1, 24, 3);
+                    const uint32_t lineWords = Field(nextW0, 9, 9);
+                    const uint32_t renderSize = Field(nextW0, 19, 2);
+                    if (lineWords == 0) {
+                        continue;
+                    }
+                    for (size_t tileSizeIndex = lookahead + 1;
+                         tileSizeIndex < std::min(lookahead + 4, MaxCommands); ++tileSizeIndex) {
+                        const uint32_t tileSizeW0 = static_cast<uint32_t>(commands[tileSizeIndex].words.w0);
+                        const uint32_t tileSizeW1 = static_cast<uint32_t>(commands[tileSizeIndex].words.w1);
+                        if (Opcode(tileSizeW0) == static_cast<uint8_t>(F3DEX2_G_ENDDL) ||
+                            Opcode(tileSizeW0) == static_cast<uint8_t>(F3DEX2_G_DL)) {
+                            break;
+                        }
+                        if (Opcode(tileSizeW0) == static_cast<uint8_t>(RDP_G_SETTILESIZE) &&
+                            Field(tileSizeW1, 24, 3) == renderTile) {
+                            // RGBA32 occupies two TMEM banks, so one image
+                            // row spans twice as many source words as its
+                            // render-tile line field. Other render sizes use
+                            // the line word count directly.
+                            const uint32_t dxtWords = lineWords * (renderSize == G_IM_SIZ_32b ? 2 : 1);
+                            const uint32_t dxt = ((1u << G_TX_DXT_FRAC) + dxtWords - 1) / dxtWords;
+                            const uint32_t originalDxt = Field(static_cast<uint32_t>(source.words.w1), 0, 12);
+                            if (dxt != originalDxt) {
+                                lowerW1 = (static_cast<uint32_t>(source.words.w1) & ~0xfffu) | (dxt & 0xfffu);
+                            }
+                            lookahead = MaxCommands;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                if (nextOpcode == static_cast<uint8_t>(RDP_G_SETTIMG) ||
+                    nextOpcode == static_cast<uint8_t>(RDP_G_LOADBLOCK) ||
+                    nextOpcode == static_cast<uint8_t>(RDP_G_LOADTILE) ||
+                    nextOpcode == static_cast<uint8_t>(F3DEX2_G_ENDDL)) {
+                    break;
+                }
+            }
         } else if (opcode == static_cast<uint8_t>(RDP_G_SETTIMG)) {
             mCurrentTextureFramebufferId = -1;
             // The exact byte count is finalized by the following load command.

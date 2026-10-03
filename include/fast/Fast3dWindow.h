@@ -62,6 +62,8 @@ class Fast3dWindow : public Ship::Window {
     std::weak_ptr<Interpreter> GetInterpreterWeak() const;
 #ifdef SHIP_USE_RT64
     Rt64Renderer* GetRt64Renderer() const { return mRt64.get(); }
+    void SetPrerenderedRoom(bool enabled) { mPrerenderedRoom = enabled; }
+    bool IsPrerenderedRoom() const { return mPrerenderedRoom; }
 #endif
 
   protected:
@@ -75,6 +77,7 @@ class Fast3dWindow : public Ship::Window {
   private:
 #ifdef SHIP_USE_RT64
     std::unique_ptr<Rt64Renderer> mRt64;
+    bool mPrerenderedRoom = false;
 #endif
     GfxRenderingAPI* mRenderingApi;
     GfxWindowBackend* mWindowManagerApi;

@@ -8,6 +8,7 @@
 #include "gbi/rt64_gbi_rdp.h"
 #include "rhi/rt64_render_hooks.h"
 #include "gui/rt64_inspector.h"
+#include "shared/rt64_fb_common.h"
 #include "plume_vulkan.h"
 #include "imgui/backends/imgui_impl_vulkan.h"
 #undef Vp_t
@@ -141,8 +142,15 @@ struct Rt64Renderer::Impl {
     std::unique_ptr<GuiApi> guiApi;
     GBI gbi{}, spriteGbi{};
     std::unordered_map<uint32_t, std::vector<uint8_t>> framebufferNativeTextureData;
+    struct FramebufferImage {
+        uint32_t width = 0, height = 0;
+        std::vector<uint8_t> rgba;
+    };
+    std::unordered_map<int, FramebufferImage> framebufferImages;
     std::unordered_set<int> framebufferReadbackReady;
     uint32_t pendingMsaa = 1;
+    uint32_t pendingWidth = 0, pendingHeight = 0;
+    float pendingX = 0, pendingY = 0, pendingPresentationWidth = 0, pendingPresentationHeight = 0;
     uint32_t nativeExtraGeometryMode = 0;
     uint64_t frames = 0;
     uint64_t testFrameLimit = 0;
@@ -155,6 +163,25 @@ struct Rt64Renderer::Impl {
     };
     std::vector<ScheduledTestKey> scheduledTestKeys;
     static Impl* active;
+    static void NativeWideRectangle(State* state, RT64::DisplayList** dl) {
+        if (!active) throw std::logic_error("No active RT64 window");
+        const auto& rectangles = active->translator.GetNativeWideRectangles();
+        const uint32_t index = (*dl)->w1;
+        if (index >= rectangles.size()) throw std::out_of_range("Native RT64 wide rectangle index");
+        const auto& rect = rectangles[index];
+        const auto previousAspect = state->rdp->extended.global.rectAspect;
+        // Ship's wide coordinates already express placement relative to the
+        // native screen center; preserve their pixel size in the wider image.
+        state->rdp->setRectAspect(G_EX_ASPECT_ADJUST);
+        if (rect.fill) {
+            state->rdp->fillRect(rect.ulx, rect.uly, rect.lrx, rect.lry);
+        }
+        else {
+            state->rdp->drawTexRect(rect.ulx, rect.uly, rect.lrx, rect.lry, rect.tile,
+                                   rect.uls, rect.ult, rect.dsdx, rect.dtdy, rect.flip);
+        }
+        state->rdp->setRectAspect(previousAspect);
+    }
     static void NativeUcode(State* state, RT64::DisplayList** dl) {
         if (!active) throw std::logic_error("No active RT64 window");
         const uint32_t index=(*dl)->w0 & 0xffffffu;
@@ -207,6 +234,63 @@ struct Rt64Renderer::Impl {
         next.resetDrawDataRanges();
         state->resetDrawCall();
     }
+    static FramebufferImage CaptureFramebuffer(State* state,
+                                               const DisplayListTranslator::NativeFramebuffer& source) {
+        // The synchronous RAM renderer deliberately uses native 4:3. Wait
+        // for the display workload instead, then retain its full GPU image.
+        state->ext.workloadQueue->waitForWorkloadId(state->workloadId);
+        std::scoped_lock lock(state->ext.sharedQueueResources->managerMutex);
+        auto& target = state->ext.sharedQueueResources->renderTargetManager.get(
+            RenderTargetKey(source.address, source.width, G_IM_SIZ_16b, Framebuffer::Type::Color));
+        FramebufferImage image;
+        if (target.isEmpty()) return image;
+        auto* worker = state->ext.framebufferGraphicsWorker;
+        const size_t imageBytes = size_t(target.width) * target.height * 4;
+        auto output = worker->device->createBuffer(RenderBufferDesc::DefaultBuffer(imageBytes,
+            RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS | RenderBufferFlag::FORMATTED));
+        auto outputView = output->createBufferFormattedView(RenderFormat::R32_UINT);
+        auto readback = worker->device->createBuffer(RenderBufferDesc::ReadbackBuffer(imageBytes));
+        FramebufferWriteDescriptorBufferSet outputSet(worker->device);
+        outputSet.setBuffer(outputSet.gOutput, output.get(), imageBytes, outputView.get());
+        FramebufferWriteDescriptorTextureSet inputSet(worker->device);
+        const auto& shader = state->ext.shaderLibrary->fbWriteColor;
+        interop::FbCommonCB constants{};
+        constants.resolution = { target.width, target.height };
+        constants.fmt = G_IM_FMT_RGBA;
+        constants.siz = G_IM_SIZ_32b;
+        constants.ditherPattern = 3; // Disabled; preserve the captured image.
+        constants.usesHDR = target.usesHDR;
+        constants.sourceScale = { 1.0f, 1.0f }; // Capture every display pixel, not the native 320x240 slice.
+        worker->commandList->begin();
+        target.resolveTarget(worker, state->ext.shaderLibrary);
+        auto* texture = target.getResolvedTexture();
+        inputSet.setTexture(inputSet.gInput, texture, RenderTextureLayout::SHADER_READ,
+                            target.getResolvedTextureView());
+        worker->commandList->barriers(RenderBarrierStage::COMPUTE,
+            RenderBufferBarrier(output.get(), RenderBufferAccess::WRITE),
+            RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
+        worker->commandList->setPipeline(shader.pipeline.get());
+        worker->commandList->setComputePipelineLayout(shader.pipelineLayout.get());
+        worker->commandList->setComputePushConstants(0, &constants);
+        worker->commandList->setComputeDescriptorSet(outputSet.get(), 0);
+        worker->commandList->setComputeDescriptorSet(inputSet.get(), 1);
+        worker->commandList->dispatch((target.width + FB_COMMON_WORKGROUP_SIZE - 1) / FB_COMMON_WORKGROUP_SIZE,
+                                     (target.height + FB_COMMON_WORKGROUP_SIZE - 1) / FB_COMMON_WORKGROUP_SIZE, 1);
+        const RenderBufferBarrier copyBarriers[] = {
+            RenderBufferBarrier(output.get(), RenderBufferAccess::READ),
+            RenderBufferBarrier(readback.get(), RenderBufferAccess::WRITE)
+        };
+        worker->commandList->barriers(RenderBarrierStage::COPY, copyBarriers, 2);
+        worker->commandList->copyBuffer(readback.get(), output.get());
+        worker->commandList->end();
+        worker->execute(); worker->wait();
+        image.width = target.width; image.height = target.height;
+        image.rgba.resize(imageBytes);
+        // RT64's RGBA32 write shader emits RGBA byte order in host memory.
+        std::memcpy(image.rgba.data(), readback->map(), imageBytes);
+        readback->unmap();
+        return image;
+    }
     static void FramebufferOperation(State* state, RT64::DisplayList** dl) {
         if (!active) throw std::logic_error("No active RT64 window");
         const auto& operations=active->translator.GetFramebufferOperations();
@@ -216,6 +300,7 @@ struct Rt64Renderer::Impl {
         if (operation.oncePerFrame && operation.copiedFlag && *reinterpret_cast<uint8_t*>(operation.copiedFlag)) return;
         if (operation.type==DisplayListTranslator::FramebufferOperation::Type::Invalidate) {
             active->framebufferReadbackReady.erase(operation.sourceId);
+            active->framebufferImages.erase(operation.sourceId);
             return;
         }
         const auto source=DisplayListTranslator::GetFramebuffer(operation.sourceId);
@@ -269,6 +354,13 @@ struct Rt64Renderer::Impl {
             native.height = source->height;
             native.nativeWidth = operation.width;
             native.nativeHeight = logicalHeight;
+            const auto image = active->framebufferImages.find(operation.sourceId);
+            if (operation.height && image != active->framebufferImages.end() && !image->second.rgba.empty()) {
+                native.rgba = image->second.rgba.data();
+                native.byteCount = image->second.rgba.size();
+                native.width = image->second.width;
+                native.height = image->second.height;
+            }
             state->rdp->registerNativeTexture(native);
             state->rdp->setTextureImage(operation.format, operation.sizeCode,
                                         static_cast<uint16_t>(operation.width), source->address);
@@ -276,6 +368,14 @@ struct Rt64Renderer::Impl {
         } else if (operation.type==DisplayListTranslator::FramebufferOperation::Type::Copy) {
             const auto destination=DisplayListTranslator::GetFramebuffer(operation.destinationId);
             if (!destination) throw std::runtime_error("Unknown RT64 framebuffer destination");
+            if (operation.sourceId == 0) {
+                active->framebufferImages[operation.destinationId] = CaptureFramebuffer(state, *source);
+            } else {
+                const auto image = active->framebufferImages.find(operation.sourceId);
+                if (image != active->framebufferImages.end())
+                    active->framebufferImages[operation.destinationId] = image->second;
+                else active->framebufferImages.erase(operation.destinationId);
+            }
             std::vector<uint16_t> pixels(destination->width*destination->height);
             for (uint32_t y=0;y<destination->height;y++) for (uint32_t x=0;x<destination->width;x++)
                 pixels[y*destination->width+x]=read(x*source->width/destination->width,y*source->height/destination->height);
@@ -370,6 +470,7 @@ struct Rt64Renderer::Impl {
             nativeGbi->map[0x3a]=ExtraGeometryMode;
             nativeGbi->map[0x40]=GrayscaleColor;
             nativeGbi->map[DisplayListTranslator::NativeFramebufferOperationOpcode]=FramebufferOperation;
+            nativeGbi->map[DisplayListTranslator::NativeWideRectangleOpcode]=NativeWideRectangle;
         }
         app->state->rsp->nativeTextureCoordinates = true;
         app->state->rsp->nativeLightLayout = true;
@@ -386,6 +487,32 @@ Rt64Renderer::~Rt64Renderer()=default;
 GfxRenderingAPI* Rt64Renderer::GetGuiApi() { return mImpl->guiApi.get(); }
 void Rt64Renderer::Run(Gfx* commands,const std::unordered_map<Mtx*,MtxF>& replacements, uint32_t interpolationIndex) {
     auto& i=*mImpl;
+    if (i.pendingWidth && i.pendingHeight) {
+        auto& config = i.app->userConfig;
+        const double multiplier = double(i.pendingHeight) / 240.0;
+        const double ratio = double(i.pendingWidth) / i.pendingHeight;
+        if (config.resolution != UserConfiguration::Resolution::Manual ||
+            config.resolutionMultiplier != multiplier || config.aspectRatio != UserConfiguration::AspectRatio::Manual ||
+            config.aspectTarget != ratio) {
+            config.resolution = UserConfiguration::Resolution::Manual;
+            config.resolutionMultiplier = multiplier;
+            config.aspectRatio = UserConfiguration::AspectRatio::Manual;
+            config.aspectTarget = ratio;
+            i.app->updateUserConfig(false);
+        }
+    }
+    if (i.pendingPresentationWidth > 0 && i.pendingPresentationHeight > 0) {
+        auto& presentation = i.app->enhancementConfig.presentation;
+        if (presentation.nativeViewportX != i.pendingX || presentation.nativeViewportY != i.pendingY ||
+            presentation.nativeViewportWidth != i.pendingPresentationWidth ||
+            presentation.nativeViewportHeight != i.pendingPresentationHeight) {
+            presentation.nativeViewportX = i.pendingX;
+            presentation.nativeViewportY = i.pendingY;
+            presentation.nativeViewportWidth = i.pendingPresentationWidth;
+            presentation.nativeViewportHeight = i.pendingPresentationHeight;
+            i.app->updateEnhancementConfig();
+        }
+    }
     auto mode=i.pendingMsaa>=8?UserConfiguration::Antialiasing::MSAA8X:i.pendingMsaa>=4?UserConfiguration::Antialiasing::MSAA4X:i.pendingMsaa>=2?UserConfiguration::Antialiasing::MSAA2X:UserConfiguration::Antialiasing::None;
     if (i.app->userConfig.antialiasing!=mode) { i.app->userConfig.antialiasing=mode; i.app->updateUserConfig(true); i.app->updateMultisampling(); }
     auto address=i.translator.Translate(commands,replacements,interpolationIndex);
@@ -447,6 +574,16 @@ void Rt64Renderer::Present() { mImpl->app->updateScreen(); }
 void Rt64Renderer::SetResolution(float multiplier) {
     auto& a=*mImpl->app; a.userConfig.resolution=UserConfiguration::Resolution::Manual;
     a.userConfig.resolutionMultiplier=std::max(multiplier,1.0f); a.updateUserConfig(false);
+}
+void Rt64Renderer::SetRenderSize(uint32_t width, uint32_t height) {
+    mImpl->pendingWidth = width;
+    mImpl->pendingHeight = height;
+}
+void Rt64Renderer::SetPresentationRect(float x, float y, float width, float height) {
+    mImpl->pendingX = x;
+    mImpl->pendingY = y;
+    mImpl->pendingPresentationWidth = width;
+    mImpl->pendingPresentationHeight = height;
 }
 void Rt64Renderer::SetMsaa(uint32_t samples) {
     // Apply after the GUI frame has released the presentation thread's mutex.

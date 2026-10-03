@@ -685,12 +685,19 @@ void Gui::CalculateGameViewport() {
 
 #ifdef SHIP_USE_RT64
     if (Context::GetInstance()->GetWindow()->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) {
-        // Game framebuffer commands address native RDRAM. RT64 controls the
-        // GPU resolution separately, so window pixels must not change this ABI.
+        // These dimensions describe the GPU output. Native display-list and
+        // framebuffer storage dimensions remain independent in the RT64 bridge.
         auto interpreter = mInterpreter.lock();
-        interpreter->mCurDimensions.width = 320;
-        interpreter->mCurDimensions.height = 240;
-        interpreter->mCurDimensions.aspect_ratio = 4.0f / 3.0f;
+        interpreter->mCurDimensions.width = std::max(1u, interpreter->mCurDimensions.width);
+        interpreter->mCurDimensions.height = std::max(1u, interpreter->mCurDimensions.height);
+        auto window = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow());
+        if (window->IsPrerenderedRoom()) {
+            interpreter->mCurDimensions.width = interpreter->mCurDimensions.height * 4 / 3;
+        }
+        interpreter->mCurDimensions.aspect_ratio = float(interpreter->mCurDimensions.width) /
+                                                   interpreter->mCurDimensions.height;
+        std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow())->GetRt64Renderer()->
+            SetRenderSize(interpreter->mCurDimensions.width, interpreter->mCurDimensions.height);
     }
 #endif
     ImGui::End();
@@ -713,17 +720,21 @@ void Gui::DrawGame() {
     ImVec2 mainPos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetContentRegionAvail();
     ImVec2 pos = ImVec2(0, 0);
+    bool forceRoomAspect = false;
+#ifdef SHIP_USE_RT64
+    forceRoomAspect = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow())->IsPrerenderedRoom();
+#endif
     if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_LOW_RES_MODE, 0) ==
         1) { // N64 Mode takes priority
         const float sw = size.y * 320.0f / 240.0f;
         pos = ImVec2(floor(size.x / 2 - sw / 2), 0);
         size = ImVec2(sw, size.y);
     } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
-                   CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0)) {
+                   CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0) || forceRoomAspect) {
         if (!Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
                 CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0)) {
             if (!Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
-                    CVAR_PREFIX_ADVANCED_RESOLUTION ".IgnoreAspectCorrection", 0)) {
+                    CVAR_PREFIX_ADVANCED_RESOLUTION ".IgnoreAspectCorrection", 0) || forceRoomAspect) {
                 float sWdth =
                     size.y * mInterpreter.lock()->mCurDimensions.width / mInterpreter.lock()->mCurDimensions.height;
                 float sHght =
@@ -750,6 +761,13 @@ void Gui::DrawGame() {
                           float(mInterpreter.lock()->mCurDimensions.height) * factor);
         }
     }
+#ifdef SHIP_USE_RT64
+    if (Context::GetInstance()->GetWindow()->GetWindowBackend() == WindowBackend::RT64_SDL_VULKAN) {
+        std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow())->GetRt64Renderer()->
+            SetPresentationRect(mainPos.x - mTemporaryWindowPos.x + pos.x,
+                                mainPos.y - mTemporaryWindowPos.y + pos.y, size.x, size.y);
+    }
+#endif
     uintptr_t fb = Ship::Context::GetInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {
         ImGui::SetCursorPos(pos);

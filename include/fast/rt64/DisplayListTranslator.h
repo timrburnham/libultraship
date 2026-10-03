@@ -27,6 +27,7 @@ class DisplayListTranslator {
     static constexpr uint32_t ColorAddress = 0x100000;
     static constexpr uint32_t DepthAddress = 0x180000;
     static constexpr uint8_t NativeFramebufferOperationOpcode = 0x43;
+    static constexpr uint8_t NativeWideRectangleOpcode = 0x44;
 
     struct NativeFramebuffer {
         int id = 0;
@@ -51,6 +52,20 @@ class DisplayListTranslator {
         uint8_t format = 0;
         uint8_t sizeCode = 0;
         uint8_t tile = 0;
+    };
+
+    struct NativeWideRectangle {
+        int32_t ulx = 0;
+        int32_t uly = 0;
+        int32_t lrx = 0;
+        int32_t lry = 0;
+        int16_t uls = 0;
+        int16_t ult = 0;
+        int16_t dsdx = 0;
+        int16_t dtdy = 0;
+        uint8_t tile = 0;
+        bool fill = false;
+        bool flip = false;
     };
 
     struct NativeTexture {
@@ -83,6 +98,7 @@ class DisplayListTranslator {
     std::vector<uint8_t>& GetRdram() { return mRdram; }
     const std::vector<uint8_t>& GetRdram() const { return mRdram; }
     const std::vector<FramebufferOperation>& GetFramebufferOperations() const { return mFramebufferOperations; }
+    const std::vector<NativeWideRectangle>& GetNativeWideRectangles() const { return mNativeWideRectangles; }
     const std::vector<NativeTexture>& GetNativeTextures() const { return mNativeTextures; }
 
   private:
@@ -138,6 +154,7 @@ class DisplayListTranslator {
     uint32_t mInterpolationIndex = 0;
     uint32_t mInterpolationIndexTarget = 0;
     std::vector<FramebufferOperation> mFramebufferOperations;
+    std::vector<NativeWideRectangle> mNativeWideRectangles;
     std::vector<NativeTexture> mNativeTextures;
 };
 
