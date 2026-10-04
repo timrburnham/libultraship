@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
@@ -244,8 +246,16 @@ struct Rt64Renderer::Impl {
             RenderTargetKey(source.address, source.width, G_IM_SIZ_16b, Framebuffer::Type::Color));
         FramebufferImage image;
         if (target.isEmpty()) return image;
+        // Targets retain their larger allocation after a resolution decrease.
+        // Capture only the currently rendered region, otherwise stale padding
+        // is stretched into native framebuffer image rectangles.
+        uint32_t imageWidth, imageHeight, misalignmentX;
+        RenderTarget::computeScaledSize(source.width, source.height, target.resolutionScale,
+                                        imageWidth, imageHeight, misalignmentX);
+        imageWidth = std::min(imageWidth, target.width);
+        imageHeight = std::min(imageHeight, target.height);
         auto* worker = state->ext.framebufferGraphicsWorker;
-        const size_t imageBytes = size_t(target.width) * target.height * 4;
+        const size_t imageBytes = size_t(imageWidth) * imageHeight * 4;
         auto output = worker->device->createBuffer(RenderBufferDesc::DefaultBuffer(imageBytes,
             RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS | RenderBufferFlag::FORMATTED));
         auto outputView = output->createBufferFormattedView(RenderFormat::R32_UINT);
@@ -255,7 +265,7 @@ struct Rt64Renderer::Impl {
         FramebufferWriteDescriptorTextureSet inputSet(worker->device);
         const auto& shader = state->ext.shaderLibrary->fbWriteColor;
         interop::FbCommonCB constants{};
-        constants.resolution = { target.width, target.height };
+        constants.resolution = { imageWidth, imageHeight };
         constants.fmt = G_IM_FMT_RGBA;
         constants.siz = G_IM_SIZ_32b;
         constants.ditherPattern = 3; // Disabled; preserve the captured image.
@@ -274,8 +284,8 @@ struct Rt64Renderer::Impl {
         worker->commandList->setComputePushConstants(0, &constants);
         worker->commandList->setComputeDescriptorSet(outputSet.get(), 0);
         worker->commandList->setComputeDescriptorSet(inputSet.get(), 1);
-        worker->commandList->dispatch((target.width + FB_COMMON_WORKGROUP_SIZE - 1) / FB_COMMON_WORKGROUP_SIZE,
-                                     (target.height + FB_COMMON_WORKGROUP_SIZE - 1) / FB_COMMON_WORKGROUP_SIZE, 1);
+        worker->commandList->dispatch((imageWidth + FB_COMMON_WORKGROUP_SIZE - 1) / FB_COMMON_WORKGROUP_SIZE,
+                                     (imageHeight + FB_COMMON_WORKGROUP_SIZE - 1) / FB_COMMON_WORKGROUP_SIZE, 1);
         const RenderBufferBarrier copyBarriers[] = {
             RenderBufferBarrier(output.get(), RenderBufferAccess::READ),
             RenderBufferBarrier(readback.get(), RenderBufferAccess::WRITE)
@@ -284,7 +294,7 @@ struct Rt64Renderer::Impl {
         worker->commandList->copyBuffer(readback.get(), output.get());
         worker->commandList->end();
         worker->execute(); worker->wait();
-        image.width = target.width; image.height = target.height;
+        image.width = imageWidth; image.height = imageHeight;
         image.rgba.resize(imageBytes);
         // RT64's RGBA32 write shader emits RGBA byte order in host memory.
         std::memcpy(image.rgba.data(), readback->map(), imageBytes);
@@ -515,7 +525,10 @@ void Rt64Renderer::Run(Gfx* commands,const std::unordered_map<Mtx*,MtxF>& replac
     }
     auto mode=i.pendingMsaa>=8?UserConfiguration::Antialiasing::MSAA8X:i.pendingMsaa>=4?UserConfiguration::Antialiasing::MSAA4X:i.pendingMsaa>=2?UserConfiguration::Antialiasing::MSAA2X:UserConfiguration::Antialiasing::None;
     if (i.app->userConfig.antialiasing!=mode) { i.app->userConfig.antialiasing=mode; i.app->updateUserConfig(true); i.app->updateMultisampling(); }
+    static const bool profile = std::getenv("SHIP_RT64_PROFILE") != nullptr;
+    const auto profileStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto address=i.translator.Translate(commands,replacements,interpolationIndex);
+    const auto profileTranslated = profile ? std::chrono::steady_clock::now() : profileStart;
     i.app->state->rdp->clearNativeTextures();
     i.framebufferNativeTextureData.clear();
     i.framebufferReadbackReady.clear();
@@ -529,6 +542,17 @@ void Rt64Renderer::Run(Gfx* commands,const std::unordered_map<Mtx*,MtxF>& replac
     i.app->interpreter->hleGBI=&i.gbi; i.app->state->rsp->setGBI(&i.gbi);
     if (i.gbi.resetFromTask) i.gbi.resetFromTask(i.app->state.get());
     i.app->processDisplayLists(i.translator.GetRdram().data(),address,0,true);
+    if (profile) {
+        static unsigned calls = 0;
+        static double translateMs = 0.0, processMs = 0.0;
+        translateMs += std::chrono::duration<double, std::milli>(profileTranslated-profileStart).count();
+        processMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-profileTranslated).count();
+        if (++calls == 120) {
+            std::fprintf(stderr, "[RT64 profile] translate=%.3f ms process=%.3f ms per submission (120 samples)\n",
+                         translateMs/calls, processMs/calls);
+            calls = 0; translateMs = processMs = 0.0;
+        }
+    }
     // A bounded launch can validate game frames without relying on desktop input.
     if (i.testFrameLimit) ++i.frames;
     for (const auto& scheduledKey : i.scheduledTestKeys) {
